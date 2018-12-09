@@ -6,9 +6,9 @@ namespace TegraSharp
 {
     internal class Program
     {
-        public static int AltInterfaceId, PipeId, Writes;
+        private static int _writes;
 
-        public static readonly byte[] Intermezzo =
+        private static readonly byte[] Intermezzo =
         {
             0x44, 0x00, 0x9F, 0xE5, // LDR   R0, [PC, #0x44]
             0x01, 0x11, 0xA0, 0xE3, // MOV   R1, #0x40000000
@@ -35,51 +35,19 @@ namespace TegraSharp
             0x00, 0x00, 0x01, 0x40  // ANDMI R0, R1, R0
         };
 
-        public static void Config(out WINUSB_PIPE_INFORMATION pipeInfo, out UsbK usb,
-            out USB_INTERFACE_DESCRIPTOR interfaceDescriptor)
+        private static UsbK FindDevice()
         {
-            var patternMatch = new KLST_PATTERN_MATCH { DeviceID = "USB\\VID_0955&PID_7321*" };
-            var deviceList = new LstK(KLST_FLAG.NONE, ref patternMatch);
-            interfaceDescriptor = new USB_INTERFACE_DESCRIPTOR();
-            pipeInfo = new WINUSB_PIPE_INFORMATION();
+            var patternMatch = new KLST_PATTERN_MATCH { DeviceID = @"USB\VID_0955&PID_7321" };
+            var deviceList = new LstK(0, ref patternMatch);
             deviceList.MoveNext(out var deviceInfo);
-            usb = new UsbK(deviceInfo);
-            FindPipeAndInterface(usb, out interfaceDescriptor, out pipeInfo, AltInterfaceId, PipeId);
-            AltInterfaceId = interfaceDescriptor.bAlternateSetting;
-            PipeId = pipeInfo.PipeId;
-            usb.SetAltInterface(interfaceDescriptor.bInterfaceNumber, false, interfaceDescriptor.bAlternateSetting);
-        }
-
-        public static bool FindPipeAndInterface(UsbK usb, out USB_INTERFACE_DESCRIPTOR interfaceDescriptor,
-            out WINUSB_PIPE_INFORMATION pipeInfo, int altInterfaceId, int pipeId)
-        {
-            byte interfaceIndex = 0;
-            interfaceDescriptor = new USB_INTERFACE_DESCRIPTOR();
-            pipeInfo = new WINUSB_PIPE_INFORMATION();
-            while (usb.SelectInterface(interfaceIndex++, true))
-            {
-                byte altSettingNumber = 0, pipeIndex = 0;
-                while (usb.QueryInterfaceSettings(altSettingNumber++, out interfaceDescriptor))
-                    if (altInterfaceId == -1 || altInterfaceId == altSettingNumber)
-                        while (usb.QueryPipe(altSettingNumber, pipeIndex++, out pipeInfo))
-                        {
-                            if (pipeInfo.MaximumPacketSize > 0 && pipeId == -1 || pipeInfo.PipeId == pipeId ||
-                                (pipeId & 0xF) == 0 && (pipeId & 0x80) == (pipeInfo.PipeId & 0x80))
-                                goto FindInterfaceDone;
-
-                            pipeInfo.PipeId = 0;
-                        }
-            }
-
-            FindInterfaceDone:
-            return pipeInfo.PipeId != 0;
+            return new UsbK(deviceInfo);
         }
 
         private static void Write(UsbK wrt, byte[] payload)
         {
             var buffer = new byte[0x1000];
 
-            for (var i = 0; i < payload.Length - 1; i += 0x1000, Writes++)
+            for (var i = 0; i < payload.Length - 1; i += 0x1000, _writes++)
             {
                 Buffer.BlockCopy(payload, i, buffer, 0, 0x1000);
                 wrt.WritePipe(1, buffer, 0x1000, out _, IntPtr.Zero);
@@ -89,51 +57,46 @@ namespace TegraSharp
         private static byte[] SwizzlePayload(byte[] payload)
         {
             var buf = new byte[(int)Math.Ceiling((66216m + payload.Length) / 0x1000) * 0x1000];
-            using (var strm = new MemoryStream())
-            using (var wrt = new BinaryWriter(strm))
+            using (var mem = new MemoryStream())
+            using (var wrt = new BinaryWriter(mem))
             {
                 wrt.Write(0x30298);
-                strm.Position = 0x2A8;
+                mem.Position = 0x2a8;
                 for (var i = 0; i < 0x3c00; i++)
                     wrt.Write(0x4001f000);
-                strm.Position = 0xf2a8;
+                mem.Position = 0xf2a8;
                 wrt.Write(Intermezzo);
-                strm.Position = 0x102a8;
+                mem.Position = 0x102a8;
                 wrt.Write(payload);
-                Array.Copy(strm.ToArray(), buf, strm.Length);
+                Array.Copy(mem.ToArray(), buf, mem.Length);
                 return buf;
             }
         }
 
         private static void Main(string[] args)
         {
-            if (args.Length != 1)
-            {
-                Console.Error.WriteLine("Usage: TegraSharp.exe payload.bin");
-                return;
-            }
-
-            var Buf = new byte[0x10];
+            var buf = new byte[0x10];
 
             UsbK Switch;
 
             try
             {
-                Config(out _, out Switch, out _);
+                Switch = FindDevice();
+                Switch.SetAltInterface(0, false, 0);
             }
-            catch (AccessViolationException)
+            catch
             {
                 Console.Error.WriteLine("Error: Cannot access device, is your Switch plugged in, turned on and in RCM mode?");
                 return;
             }
 
-            Switch.ReadPipe(0x81, Buf, 0x10, out _, IntPtr.Zero);
-            Console.WriteLine($"Device ID: {BitConverter.ToString(Buf).Replace("-", "").ToLower()}");
+            Switch.ReadPipe(0x81, buf, 0x10, out _, IntPtr.Zero);
+            Console.WriteLine("Device ID: {0}", BitConverter.ToString(buf).Replace("-", "").ToLower());
 
             Console.WriteLine("Writing payload...");
             Write(Switch, SwizzlePayload(File.ReadAllBytes(args[0])));
 
-            if (Writes % 2 != 1)
+            if (_writes % 2 != 1)
             {
                 Console.WriteLine("Switching buffers...");
                 Switch.WritePipe(1, new byte[0x1000], 0x1000, out _, IntPtr.Zero);
@@ -151,10 +114,9 @@ namespace TegraSharp
 
             var result = Switch.ControlTransfer(setup, new byte[0x7000], 0x7000, out var b, IntPtr.Zero);
 
-            if (!result)
-                Console.WriteLine("Successfully smashed device!");
-            else
-                Console.WriteLine($"Length transferred was 0x{b:x} bytes... it seems your Switch isn't vulnerable.");
+            Console.WriteLine(!result
+                ? "Successfully smashed device!"
+                : $"Length transferred was 0x{b:x} bytes... it seems your Switch isn't vulnerable.");
         }
     }
 }
